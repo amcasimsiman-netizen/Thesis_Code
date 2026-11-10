@@ -345,6 +345,31 @@ class Simulation:
             for cell, node in group:
                 forces_m[cell.id, node] = total_force
 
+    def _heun_second_stage(self, k1_m, k1_n, t):
+            h = self.h
+
+            predicted_states = []
+            for cell in self.all_cells:
+                pred_m = cell.m + h * k1_m[cell.id]
+                pred_n = cell.n + h * k1_n[cell.id]
+                cell_temp = Cell(cell.id, [0, 0], cell.parameters)
+                cell_temp.m = pred_m.copy()
+                cell_temp.n = pred_n.copy()
+                cell_temp.rho1 = cell.rho1
+                cell_temp.rho2 = cell.rho2
+                pred_com = cell_temp.calculate_center_of_mass()
+                predicted_states.append((pred_m, pred_n, pred_com))
+
+            k2_forces = [
+                self._calculate_forces_at_state(cell, pred_m, pred_n, pred_com, t + h)
+                for cell, (pred_m, pred_n, pred_com) in zip(self.all_cells, predicted_states)
+            ]
+            k2_m = np.stack([f[0] for f in k2_forces])
+            k2_n = np.stack([f[1] for f in k2_forces])
+            self._apply_adhesion_forces(k2_m)
+
+            return k2_m, k2_n
+
     def _step_heuns_method(self, t):
         h = self.h
 
@@ -353,25 +378,7 @@ class Simulation:
         k1_n = np.stack([f[1] for f in k1_forces])
         self._apply_adhesion_forces(k1_m)
 
-        predicted_states = []
-        for cell in self.all_cells:
-            pred_m = cell.m + h * k1_m[cell.id]
-            pred_n = cell.n + h * k1_n[cell.id]
-            cell_temp = Cell(cell.id, [0, 0], cell.parameters)
-            cell_temp.m = pred_m.copy()
-            cell_temp.n = pred_n.copy()
-            cell_temp.rho1 = cell.rho1
-            cell_temp.rho2 = cell.rho2
-            pred_com = cell_temp.calculate_center_of_mass()
-            predicted_states.append((pred_m, pred_n, pred_com))
-
-        k2_forces = [
-            self._calculate_forces_at_state(cell, pred_m, pred_n, pred_com, t + h)
-            for cell, (pred_m, pred_n, pred_com) in zip(self.all_cells, predicted_states)
-        ]
-        k2_m = np.stack([f[0] for f in k2_forces])
-        k2_n = np.stack([f[1] for f in k2_forces])
-        self._apply_adhesion_forces(k2_m)
+        k2_m, k2_n = self._heun_second_stage(k1_m, k1_n, t)
 
         for cell in self.all_cells:
             f1_m, f2_m = k1_m[cell.id], k2_m[cell.id]
@@ -389,13 +396,15 @@ class Simulation:
     def _step_ab2_method(self, t):
         h = self.h
 
-        current_forces = [
-            self._calculate_current_forces(cell, t)
-            for cell in self.all_cells
-        ]
+        current_forces = [self._calculate_current_forces(cell, t) for cell in self.all_cells]
         fn_m = np.stack([f[0] for f in current_forces])
         fn_n = np.stack([f[1] for f in current_forces])
         self._apply_adhesion_forces(fn_m)
+
+        if any(cell.restart.any() for cell in self.all_cells):
+            k2_m, k2_n = self._heun_second_stage(fn_m, fn_n, t)
+        else:
+            k2_m = k2_n = None
 
         for cell in self.all_cells:
             f_curr_m = fn_m[cell.id]
@@ -408,8 +417,8 @@ class Simulation:
 
             if cell.restart.any():
                 r = cell.restart
-                new_m[r] = cell.m[r] + h * f_curr_m[r]
-                new_n[r] = cell.n[r] + h * f_curr_n[r]
+                new_m[r] = cell.m[r] + (h / 2.0) * (f_curr_m[r] + k2_m[cell.id][r])
+                new_n[r] = cell.n[r] + (h / 2.0) * (f_curr_n[r] + k2_n[cell.id][r])
 
             cell.restart[:] = False
 
