@@ -1,6 +1,9 @@
 # Farmer-Harris Cell Model Simulation
 Python implementation of the Farmer & Harris discrete cell model studying cell migration, deformation, and clustering due to chemotaxis.
 
+# Dilão and Hauser Ginzburg-Landau System
+Python implementation of the Dilão & Hauser chemical signal propagating wave. 
+
 ## Requirements
 * Python 3.13 (64-bit)
 * NumPy
@@ -13,6 +16,8 @@ Python implementation of the Farmer & Harris discrete cell model studying cell m
 * **`CASE_3.py`**: Multiple cells aggregating toward a signal source.
 * **`CASE_4.py`**: Multiple cells aggregating toward two signal sources.
 * **`CASE_5.py`**: Collective migration toward multiple signal cells with time-delayed signaling.
+* **`SPIRAL_CASE1.py`**: Symmetric arrangement of cells around a signal source.
+* **`SPIRAL_CASE2.py`**: Randomly placed cells around a signal source.
 
 ## Running the Cases
 Run any self-contained case script to execute the simulation and generate its `.mp4` animation:
@@ -22,3 +27,5 @@ python CASE_2.py
 python CASE_3.py
 python CASE_4.py
 python CASE_5.py
+python SPIRAL_CASE1.py
+python SPIRAL_CASE2.py
