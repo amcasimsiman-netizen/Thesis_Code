@@ -464,7 +464,7 @@ if __name__ == "__main__":
     FRAMES = 200
     ANIMATION_SPEED_FACTOR = 50
     N_TIMESTEPS_CALCULATED = FRAMES * ANIMATION_SPEED_FACTOR
-    N_NODES = 500
+    N_NODES = 300
     DOMAIN_RADIUS = 10.0
     N_OUTER_CELLS = 8
     OUTER_RING_RADIUS = 6.0
@@ -475,13 +475,13 @@ if __name__ == "__main__":
     sim_params = {
         'CASE_NAME': 'Case 1 (AB2 Scheme, Ginzburg-Landau + Directional Sensing)',
         'N_NODES': N_NODES,
-        'MEMBRANE_RADIUS': 1.0,
-        'NUCLEUS_RADIUS': 0.25,
+        'MEMBRANE_RADIUS': 0.7,
+        'NUCLEUS_RADIUS': 0.175,
         'ALPHA': 0.5,
         'DELTA': 30,
         'ALPHA_N': 100,
         'BETA': 2.5,
-        'REACTION_DAMPING_K': 0.2 ** (1 / 100.0),
+        'REACTION_DAMPING_K': 0.2 ** (1 / 60.0),
         'MAX_TIME': TARGET_MAX_TIME,
         'N_TIMESTEPS': N_TIMESTEPS_CALCULATED,
         'ANIMATION_SPEED_FACTOR': ANIMATION_SPEED_FACTOR,
@@ -496,7 +496,7 @@ if __name__ == "__main__":
         'MU_W': 0.1, 
         'DIRECTIONAL_SENSING': True,
 
-        'N_SIGNAL_CELLS': 1,
+        'N_SIGNAL_CELLS': 0,
         'SIGNAL_CENTERS': [(0.0, 0.0)],
         'SIGNAL_START_TIMES': [0.0],
         'OUTER_CENTERS': outer_centers,
@@ -585,5 +585,5 @@ if __name__ == "__main__":
 
     ani = FuncAnimation(fig, update_animation, frames=FRAMES + 1, interval=50, blit=True, repeat=False)
     writer = FFMpegWriter(fps=20, metadata=dict(artist='Me'), bitrate=1800)
-    ani.save("SPIRAL_CASE1.mp4", writer=writer)
+    ani.save("SPIRAL_CASE1_no signal.mp4", writer=writer)
     print("Done!")
