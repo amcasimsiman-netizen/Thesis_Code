@@ -8,8 +8,6 @@ class Cell:
     def __init__(self, cell_id, initial_center, parameters):
         self.id = cell_id
         self.parameters = parameters
-        self.is_emitting_signal = False
-        self.signal_start_time = 0.0
         self.rho1 = parameters.get('CYTOPLASM_DENSITY', 1.2)
         self.rho2 = parameters.get('NUCLEUS_DENSITY', 1.4)
 
@@ -64,12 +62,56 @@ class ChemicalSignalModule:
     def __init__(self, parameters):
         self.params = parameters
         self.sources = []
-        self.source_ids = set()
         self.seeded = set()
 
         self.n = parameters['GRID_RES']
         self.radius = parameters['DOMAIN_RADIUS']
         self.k = 2 * self.radius / (self.n - 1)
+
+        xs = np.linspace(-self.radius, self.radius, self.n)
+        gx, gy = np.meshgrid(xs, xs)
+        dist = np.hypot(gx, gy)
+
+        if parameters.get('CIRCULAR_DOMAIN', True):
+            self.inside = dist <= self.radius
+            wall_dist = self.radius - dist
+        else:
+            self.inside = np.ones((self.n, self.n), dtype=bool)
+            wall_dist = np.minimum(np.minimum(gx + self.radius, self.radius - gx),
+                                   np.minimum(gy + self.radius, self.radius - gy))
+
+        width = parameters.get('EDGE_WIDTH', 0.0)
+        drop = parameters.get('EDGE_BETA_DROP', 0.0)
+        if width > 0 and drop > 0:
+            ramp = np.clip((width - wall_dist) / width, 0.0, 1.0)
+        else:
+            ramp = np.zeros_like(wall_dist)
+        self.beta_field = parameters['GL_R'] - drop * ramp
+
+        if parameters.get('ISOTROPIC_LAPLACIAN', True):
+            near_w, diag_w = 4.0, 1.0
+            self.lap_scale = 1.0 / (6.0 * self.k**2)
+            self.stability_limit = 0.375
+        else:
+            near_w, diag_w = 1.0, 0.0
+            self.lap_scale = 1.0 / self.k**2
+            self.stability_limit = 0.25
+
+        padded = np.pad(self.inside, 1, constant_values=False)
+        self.nearest = {}
+        self.stencil = []
+        for dj in (-1, 0, 1):
+            for di in (-1, 0, 1):
+                if dj == 0 and di == 0:
+                    continue
+                nbr = padded[1 + dj:1 + dj + self.n, 1 + di:1 + di + self.n]
+                if dj == 0 or di == 0:
+                    self.nearest[(dj, di)] = nbr
+                    weight = near_w
+                else:
+                    weight = diag_w
+                if weight > 0:
+                    self.stencil.append((weight, nbr.astype(float), dj, di))
 
         self.C = np.zeros((self.n, self.n))
         self.W = np.zeros((self.n, self.n))
@@ -78,19 +120,18 @@ class ChemicalSignalModule:
 
         h = parameters['MAX_TIME'] / parameters['N_TIMESTEPS']
         lam = max(parameters['MU_C'], parameters['MU_W']) * h / self.k**2
-        if lam >= 0.25:
-            raise ValueError(f"Unstable scheme: mu*h/k^2 = {lam:.3f} must be < 1/4")
+        if lam >= self.stability_limit:
+            raise ValueError(f"Unstable scheme: mu*h/k^2 = {lam:.3f} must be < {self.stability_limit}")
 
-    def add_source(self, cell):
-        self.sources.append(cell)
-        self.source_ids.add(cell.id)
+    def add_source(self, center, start_time=0.0):
+        self.sources.append((np.asarray(center, dtype=float), float(start_time)))
 
     def seed_pending(self, t):
-        for source in self.sources:
-            if source.id in self.seeded or t < source.signal_start_time:
+        for idx, (center, start_time) in enumerate(self.sources):
+            if idx in self.seeded or t < start_time:
                 continue
-            self._seed(source.center_of_mass)
-            self.seeded.add(source.id)
+            self._seed(center)
+            self.seeded.add(idx)
             self._gradient_cache = None
             self._dt_cache = None
 
@@ -106,19 +147,23 @@ class ChemicalSignalModule:
             self.W[j, i] = rho * np.sin(phase)
 
     def _laplacian(self, F):
-        P = np.pad(F, 1, mode='edge')
-        return (P[2:, 1:-1] + P[:-2, 1:-1] + P[1:-1, 2:] + P[1:-1, :-2] - 4 * F) / self.k**2
+        P = np.pad(F, 1)
+        n = self.n
+        out = np.zeros_like(F)
+        for weight, nbr, dj, di in self.stencil:
+            out += weight * nbr * (P[1 + dj:1 + dj + n, 1 + di:1 + di + n] - F)
+        return out * self.lap_scale * self.inside
 
     def _compute_rates(self):
         p = self.params
         C, W = self.C, self.W
         mag = C**2 + W**2
 
-        reaction_c = p['GL_ETA'] * C - p['GL_R'] * W + mag * (p['GL_A'] * C - p['GL_B'] * W)
-        reaction_w = p['GL_R'] * C + p['GL_ETA'] * W + mag * (p['GL_A'] * W + p['GL_B'] * C)
+        reaction_c = p['GL_ETA'] * C - self.beta_field * W + mag * (p['GL_A'] * C - p['GL_B'] * W)
+        reaction_w = self.beta_field * C + p['GL_ETA'] * W + mag * (p['GL_A'] * W + p['GL_B'] * C)
 
-        dC_dt = reaction_c + p['MU_C'] * self._laplacian(C)
-        dW_dt = reaction_w + p['MU_W'] * self._laplacian(W)
+        dC_dt = (reaction_c + p['MU_C'] * self._laplacian(C)) * self.inside
+        dW_dt = (reaction_w + p['MU_W'] * self._laplacian(W)) * self.inside
         return dC_dt, dW_dt
 
     def step(self, h):
@@ -130,7 +175,14 @@ class ChemicalSignalModule:
 
     def _gradient_fields(self):
         if self._gradient_cache is None:
-            gy, gx = np.gradient(self.C, self.k)
+            C, n = self.C, self.n
+            P = np.pad(C, 1)
+
+            def neighbour(dj, di):
+                return np.where(self.nearest[(dj, di)], P[1 + dj:1 + dj + n, 1 + di:1 + di + n], C)
+
+            gx = (neighbour(0, 1) - neighbour(0, -1)) / (2 * self.k) * self.inside
+            gy = (neighbour(1, 0) - neighbour(-1, 0)) / (2 * self.k) * self.inside
             self._gradient_cache = (gx, gy)
         return self._gradient_cache
 
@@ -150,10 +202,7 @@ class ChemicalSignalModule:
         return ((1 - fv) * ((1 - fu) * F[j, i] + fu * F[j, i + 1])
                 + fv * ((1 - fu) * F[j + 1, i] + fu * F[j + 1, i + 1]))
 
-    def calculate_gradient(self, positions, exclude_id=None):
-        if exclude_id in self.source_ids:
-            return np.zeros_like(positions)
-
+    def calculate_gradient(self, positions):
         gx, gy = self._gradient_fields()
         grad = np.column_stack((self._sample(gx, positions), self._sample(gy, positions)))
 
@@ -165,7 +214,7 @@ class ChemicalSignalModule:
         return grad
 
     def get_field(self):
-        return self.C
+        return np.ma.masked_where(~self.inside, self.C)
 
 
 class CollisionModule:
@@ -289,28 +338,31 @@ class Simulation:
         self.time_step = 0
         self.h = parameters['MAX_TIME'] / parameters['N_TIMESTEPS']
 
+        stiffness = max(
+            8 * parameters['DELTA'],
+            parameters['ALPHA_N'] + 4 * parameters.get('DELTA_N', parameters['DELTA']) + parameters['ALPHA'],
+        )
+        if self.h * stiffness > 0.8:
+            raise ValueError(
+                f"Unstable cell step: h*stiffness = {self.h * stiffness:.2f} must be < 0.8 "
+                f"(use h < {0.8 / stiffness:.4f})"
+            )
+
     def initialize_simulation(self):
         p = self.params
         signal_centers = p['SIGNAL_CENTERS']
         signal_start_times = p['SIGNAL_START_TIMES']
         outer_centers = p['OUTER_CENTERS']
 
-        for signal_id, (center, start_time) in enumerate(
-            zip(signal_centers, signal_start_times)
-        ):
-            cell = Cell(signal_id, center, p)
-            cell.is_emitting_signal = True
-            cell.signal_start_time = start_time
-            self.all_cells.append(cell)
-            self.chemical_module.add_source(cell)
+        for center, start_time in zip(signal_centers, signal_start_times):
+            self.chemical_module.add_source(center, start_time)
 
         self.chemical_module.seed_pending(0.0)
-        first_outer_id = len(signal_centers)
 
         for k, center in enumerate(outer_centers):
-            self.all_cells.append(Cell(first_outer_id + k, center, p))
+            self.all_cells.append(Cell(k, center, p))
 
-        print(f"{p['CASE_NAME']} initialized: {len(signal_centers)} signal cell + {len(outer_centers)} outer cells.")
+        print(f"{p['CASE_NAME']} initialized: {len(outer_centers)} cells.")
 
     def run_one_step(self):
         current_time = self.time_step * self.h
@@ -336,7 +388,7 @@ class Simulation:
 
         effective_beta = (p['BETA'] * p['REACTION_DAMPING_K'] ** np.count_nonzero(cell.bonded))
 
-        gradient = self.chemical_module.calculate_gradient(m, cell.id)
+        gradient = self.chemical_module.calculate_gradient(m)
         force_chemotaxis = effective_beta * gradient
         force_chemotaxis[cell.bonded] = 0.0
 
@@ -459,22 +511,20 @@ class Simulation:
             cell.center_of_mass = cell.calculate_center_of_mass()
 
 
-if __name__ == "__main__":
-    TARGET_MAX_TIME = 20.0
-    FRAMES = 200
-    ANIMATION_SPEED_FACTOR = 50
-    N_TIMESTEPS_CALCULATED = FRAMES * ANIMATION_SPEED_FACTOR
-    N_NODES = 300
-    DOMAIN_RADIUS = 10.0
-    N_OUTER_CELLS = 8
-    OUTER_RING_RADIUS = 6.0
 
-    ring_angles = np.linspace(0, 2 * np.pi, N_OUTER_CELLS, endpoint=False)
-    outer_centers = [(OUTER_RING_RADIUS * np.cos(a), OUTER_RING_RADIUS * np.sin(a)) for a in ring_angles]
+def default_params(max_time=50.0, frames=500, h=0.002):
+    speed_factor = max(1, round(max_time / h / frames))
+    n_timesteps = frames * speed_factor
+    domain_radius = 10.0
+    n_outer_cells = 8
+    outer_ring_radius = 6.0
 
-    sim_params = {
-        'CASE_NAME': 'Case 1 (AB2 Scheme, Ginzburg-Landau + Directional Sensing)',
-        'N_NODES': N_NODES,
+    ring_angles = np.linspace(0, 2 * np.pi, n_outer_cells, endpoint=False)
+    outer_centers = [(outer_ring_radius * np.cos(a), outer_ring_radius * np.sin(a)) for a in ring_angles]
+
+    return {
+        'CASE_NAME': 'Case 1 (Spiral Wave)',
+        'N_NODES': 300,
         'MEMBRANE_RADIUS': 0.7,
         'NUCLEUS_RADIUS': 0.175,
         'ALPHA': 0.5,
@@ -482,21 +532,25 @@ if __name__ == "__main__":
         'ALPHA_N': 100,
         'BETA': 2.5,
         'REACTION_DAMPING_K': 0.2 ** (1 / 60.0),
-        'MAX_TIME': TARGET_MAX_TIME,
-        'N_TIMESTEPS': N_TIMESTEPS_CALCULATED,
-        'ANIMATION_SPEED_FACTOR': ANIMATION_SPEED_FACTOR,
+        'MAX_TIME': max_time,
+        'N_TIMESTEPS': n_timesteps,
+        'ANIMATION_SPEED_FACTOR': speed_factor,
+        'FRAMES': frames,
 
-        'DOMAIN_RADIUS': DOMAIN_RADIUS,
+        'DOMAIN_RADIUS': domain_radius,
         'GRID_RES': 200,
+        'CIRCULAR_DOMAIN': True,
+        'ISOTROPIC_LAPLACIAN': True,
         'GL_ETA': 2.0,
-        'GL_R': 1.00, 
-        'GL_A': -2.0, 
-        'GL_B': 2.0, 
-        'MU_C': 0.1, 
-        'MU_W': 0.1, 
+        'GL_R': 1.00,
+        'GL_A': -2.0,
+        'GL_B': 2.0,
+        'MU_C': 0.1,
+        'MU_W': 0.1,
+        'EDGE_WIDTH': 0.0,
+        'EDGE_BETA_DROP': 0.0,
         'DIRECTIONAL_SENSING': True,
 
-        'N_SIGNAL_CELLS': 0,
         'SIGNAL_CENTERS': [(0.0, 0.0)],
         'SIGNAL_START_TIMES': [0.0],
         'OUTER_CENTERS': outer_centers,
@@ -504,21 +558,24 @@ if __name__ == "__main__":
         'RANDOM_SEED': None,
     }
 
-    sim = Simulation(sim_params)
-    sim.initialize_simulation()
+
+def render(sim, sim_params, filename):
+    domain_radius = sim_params['DOMAIN_RADIUS']
+    frames = sim_params['FRAMES']
+    half = domain_radius + sim.chemical_module.k / 2
 
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.set_facecolor('#001122')
     ax.set_aspect('equal', 'box')
-    ax.set_xlim(-DOMAIN_RADIUS, DOMAIN_RADIUS)
-    ax.set_ylim(-DOMAIN_RADIUS, DOMAIN_RADIUS)
+    ax.set_xlim(-domain_radius, domain_radius)
+    ax.set_ylim(-domain_radius, domain_radius)
 
     spiral_cmap = LinearSegmentedColormap.from_list('dilao', ['#1010ff', '#3a0a50', '#ff1010'])
     limit_cycle_radius = np.sqrt(-sim_params['GL_ETA'] / sim_params['GL_A'])
 
     gradient_image = ax.imshow(
         sim.chemical_module.get_field(),
-        extent=[-DOMAIN_RADIUS, DOMAIN_RADIUS, -DOMAIN_RADIUS, DOMAIN_RADIUS],
+        extent=[-half, half, -half, half],
         origin='lower',
         cmap=spiral_cmap,
         vmin=-limit_cycle_radius,
@@ -527,15 +584,13 @@ if __name__ == "__main__":
         alpha=0.8
     )
     cell_plots = []
-    n_signal_cells = sim_params['N_SIGNAL_CELLS']
 
-    for i, cell in enumerate(sim.all_cells):
+    for cell in sim.all_cells:
         mem_pos = cell.get_membrane_positions()
         nuc_pos = cell.get_nucleus_positions()
-        face = 'pink' if i < n_signal_cells else 'white'
 
-        mem_fill = ax.fill(mem_pos[:, 0], mem_pos[:, 1], color=face, alpha=1, zorder=2)[0]
-        nuc_fill = ax.fill(nuc_pos[:, 0], nuc_pos[:, 1], color=face, alpha=1, zorder=3)[0]
+        mem_fill = ax.fill(mem_pos[:, 0], mem_pos[:, 1], color='white', alpha=1, zorder=2)[0]
+        nuc_fill = ax.fill(nuc_pos[:, 0], nuc_pos[:, 1], color='white', alpha=1, zorder=3)[0]
         mem_plot, = ax.plot(mem_pos[:, 0], mem_pos[:, 1], '-', color='black', zorder=4)
         nuc_plot, = ax.plot(nuc_pos[:, 0], nuc_pos[:, 1], '-', color='black', zorder=4)
 
@@ -583,7 +638,14 @@ if __name__ == "__main__":
             [time_text, gradient_image]
         )
 
-    ani = FuncAnimation(fig, update_animation, frames=FRAMES + 1, interval=50, blit=True, repeat=False)
+    ani = FuncAnimation(fig, update_animation, frames=frames + 1, interval=50, blit=True, repeat=False)
     writer = FFMpegWriter(fps=20, metadata=dict(artist='Me'), bitrate=1800)
-    ani.save("SPIRAL_CASE1_no signal.mp4", writer=writer)
+    ani.save(filename, writer=writer)
     print("Done!")
+
+
+if __name__ == "__main__":
+    sim_params = default_params()
+    sim = Simulation(sim_params)
+    sim.initialize_simulation()
+    render(sim, sim_params, "spiral1_1 (2).mp4")
